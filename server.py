@@ -1845,7 +1845,8 @@ async function tabProbes(b){
       <td>${esc(t.name)}</td><td>${esc(t.type)}</td>
       <td style="color:var(--dim)">${esc(t.host)}${t.type === "tcp" && t.port ? ":" + t.port : ""}${t.type === "http" && t.path ? esc(t.path) : ""}</td>
       <td>${t.interval}s</td><td>${t.enabled ? "启用" : "停用"}</td>
-      <td><button class="btn sm ghost" onclick='editProbe(${t.id})'>编辑</button>
+      <td><button class="btn sm ghost" onclick='testProbe(${t.id})'>⚡测试</button>
+          <button class="btn sm ghost" onclick='editProbe(${t.id})'>编辑</button>
           <button class="btn sm danger" onclick="delProbe(${t.id})">删除</button></td>
     </tr>`).join("") + `</table>
     <div class="frm"><h3>➕ 添加拨测任务</h3><div id="probe-form"></div>
@@ -1915,6 +1916,21 @@ async function delProbe(id){
   if (!confirm("确定删除该拨测任务及其历史结果吗？")) return;
   const r = await apiAdmin("DELETE", `/api/admin/probes/${id}`);
   if (r.ok) renderAtab(); else alert("删除失败：" + (r.error || ""));
+}
+
+// v6.2：服务端即时测试拨测任务（服务端视角，各节点结果仍走 agent 周期）
+async function testProbe(id){
+  const btn = event && event.target ? event.target : null;
+  if (btn) { btn.disabled = true; btn.textContent = "⏳…"; }
+  try {
+    const r = await apiAdmin("POST", `/api/admin/probes/${id}/test`);
+    if (!r.ok) { alert("测试失败：" + (r.error || "")); return; }
+    alert(r.reachable
+      ? `✅ ${r.name}\n服务端即时测试：延迟 ${r.latency} ms，丢包 ${r.loss}%\n（各节点独立结果将在 60 秒内出现在拨测页）`
+      : `❌ ${r.name}\n服务端即时测试：不通（丢包 ${r.loss}%），请检查目标地址/端口`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "⚡测试"; }
+  }
 }
 
 // ---- 告警规则 ----
@@ -2041,7 +2057,7 @@ async function tabAlerts(b){
 window.openDetail = openDetail; window.closeDetail = closeDetail;
 window.setRange = setRange; window.renameNode = renameNode; window.deleteNode = deleteNode;
 window.nav = nav; window.atab = atab; window.saveNodeMeta = saveNodeMeta; window.updAddNodeCmd = updAddNodeCmd; window.copyAddNodeCmd = copyAddNodeCmd;
-window.saveProbe = saveProbe; window.editProbe = editProbe; window.delProbe = delProbe;
+window.saveProbe = saveProbe; window.editProbe = editProbe; window.delProbe = delProbe; window.testProbe = testProbe;
 window.pfType = pfType; window.saveRule = saveRule; window.delRule = delRule;
 window.rfMetric = rfMetric; window.cfType = cfType; window.saveChannel = saveChannel;
 window.testChannel = testChannel; window.delChannel = delChannel;
@@ -2169,6 +2185,73 @@ def valid_probe_task(d):
             return False, "TCP 端口需在 1~65535 之间"
     return True, ""
 
+
+def _ping_parse(out):
+    """解析 ping 输出，返回 (avg_ms 或 None, loss_%)。"""
+    m = re.search(r"(\d+(?:\.\d+)?)% packet loss", out)
+    loss = float(m.group(1)) if m else 100.0
+    m = re.search(r"(?:rtt|round-trip).*?=\s*[\d.]+/([\d.]+)/", out)
+    if m:
+        return float(m.group(1)), loss
+    m = re.search(r"Average = (\d+)ms", out)
+    if m:
+        return float(m.group(1)), loss
+    return (None, loss) if loss >= 100 else (None, loss)
+
+
+def run_probe_now(t):
+    """v6.2：服务端即时执行单个拨测任务 3 次（与 agent 逻辑一致）。
+    返回 (avg_latency_ms 或 None, loss_%)。绝不抛异常。注意：这是从服务端视角探测，
+    各节点的独立探测结果仍由 agent 按周期上报。"""
+    try:
+        ttype = (t.get("type") or "").strip() if isinstance(t, dict) else t["type"]
+        host = (t.get("host") or "").strip() if isinstance(t, dict) else t["host"]
+        port = t.get("port") if isinstance(t, dict) else t["port"]
+        path = (t.get("path") or "").strip() if isinstance(t, dict) else (t["path"] or "")
+        if not host or ttype not in ("ping", "tcp", "http"):
+            return (None, 100.0)
+        n = 3
+        if ttype == "ping":
+            cmd = ["ping", "-c", str(n), "-W", "2", host]
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                return _ping_parse(p.stdout or "")
+            except Exception:
+                return (None, 100.0)
+        elif ttype == "tcp":
+            port = int(port or 80)
+            lat, fails = [], 0
+            for _ in range(n):
+                s = socket.socket()
+                s.settimeout(3)
+                t0 = time.time()
+                try:
+                    s.connect((host, port))
+                    lat.append((time.time() - t0) * 1000)
+                except Exception:
+                    fails += 1
+                finally:
+                    s.close()
+            return (sum(lat) / len(lat) if lat else None, fails / n * 100.0)
+        else:  # http
+            url = host if host.startswith("http") else "http://" + host
+            if path:
+                url = url.rstrip("/") + path
+            lat, fails = [], 0
+            for _ in range(n):
+                t0 = time.time()
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 MyProbe"})
+                    with urllib.request.urlopen(req, timeout=6) as r:
+                        r.read(1024)
+                    lat.append((time.time() - t0) * 1000)
+                except Exception:
+                    fails += 1
+            return (sum(lat) / len(lat) if lat else None, fails / n * 100.0)
+    except Exception:
+        return (None, 100.0)
+
+
 @app.route("/api/probes")
 def api_probes():
     """公开：拨测任务 + 最新结果 + 近 30 次历史（画小条形图用）。"""
@@ -2254,6 +2337,19 @@ def admin_probe_delete(tid):
     if cur.rowcount == 0:
         return jsonify({"ok": False, "error": "任务不存在"}), 404
     return jsonify({"ok": True})
+
+@app.route("/api/admin/probes/<int:tid>/test", methods=["POST"])
+@login_required
+def admin_probe_test(tid):
+    """v6.2：服务端即时执行一次拨测任务，返回延迟/丢包（服务端视角）。"""
+    db = get_db()
+    r = db.execute("SELECT * FROM probe_tasks WHERE id=?", (tid,)).fetchone()
+    if not r:
+        return jsonify({"ok": False, "error": "任务不存在"}), 404
+    lat, loss = run_probe_now(dict(r))
+    return jsonify({"ok": True, "id": tid, "name": r["name"],
+                    "latency": round(lat, 1) if lat is not None else None,
+                    "loss": round(loss, 1), "reachable": lat is not None})
 
 # ================= v2：节点计费/到期/配额 =================
 @app.route("/api/admin/node/<nid>/meta", methods=["PUT"])
@@ -2694,7 +2790,7 @@ from jinja2 import DictLoader as _DictLoader
 from jinja2 import Environment as _JinjaEnv
 from jinja2 import FileSystemLoader as _FileSystemLoader
 
-MYPROBE_VERSION = "6.1"
+MYPROBE_VERSION = "6.2"
 
 THEMES_DIR = os.environ.get("MYPROBE_THEMES_DIR", os.path.join(BASE_DIR, "themes"))
 PLUGINS_DIR = os.environ.get("MYPROBE_PLUGINS_DIR", os.path.join(BASE_DIR, "plugins"))
