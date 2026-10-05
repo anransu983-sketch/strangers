@@ -1,0 +1,6 @@
+Flask>=3.0
+# psutil 只给 agent 用；服务端本身不需要
+psutil>=5.9
+# v6.0：Web SSH 终端
+paramiko>=3.0
+cryptography>=41.0

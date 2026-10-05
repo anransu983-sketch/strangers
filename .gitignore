@@ -1,0 +1,31 @@
+# 密钥与真实数据
+.env
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 构建产物 / 发布包（走 GitHub Releases，不进仓库）
+*.tar.gz
+*.zip
+
+# 历史升级脚本（含临时下载链接，不进仓库）
+samples/update-*.sh
+
+# 损坏的测试主题
+themes/broken/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

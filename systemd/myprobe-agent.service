@@ -1,0 +1,20 @@
+[Unit]
+Description=MyProbe Agent
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/myprobe
+# 方式一：用环境变量配置（推荐，把下面 MYPROBE_* 改成实际值）
+Environment=MYPROBE_SERVER=https://probe.example.com
+Environment=MYPROBE_TOKEN=CHANGE_ME_与服务端一致
+Environment=MYPROBE_NODE_ID=uk-vps
+Environment=MYPROBE_NAME=英国9929
+Environment=MYPROBE_INTERVAL=5
+ExecStart=/usr/bin/python3 /opt/myprobe/agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

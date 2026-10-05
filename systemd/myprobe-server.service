@@ -1,0 +1,15 @@
+[Unit]
+Description=MyProbe Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/myprobe
+EnvironmentFile=/opt/myprobe/.env
+ExecStart=/usr/bin/python3 /opt/myprobe/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

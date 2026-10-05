@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<!-- theme:bocchi 波奇ちゃん -->
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🔭 波奇ちゃん探针</title>
+<link rel="stylesheet" href="{{ theme_static }}/css/style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">🎸 波奇ちゃん<small>MyProbe · v{{ version }}</small></div>
+    <div class="spacer"></div>
+    <nav class="nav">
+      <a href="#" data-v="board" class="navbtn on">📊 看板</a>
+      <a href="#" data-v="probes" class="navbtn">📡 拨测</a>
+      <a href="#" data-v="admin" class="navbtn" id="adminNav" style="display:none">⚙️ 管理</a>
+      <button class="iconbtn" id="themeToggle" title="切换明暗">🌙</button>
+    </nav>
+  </header>
+  <div class="stateline" id="stateline">加载中…</div>
+
+  <div id="plugin-cards">{{ plugin_cards|safe }}</div>
+
+  <div id="view-board"><div class="grid" id="grid"><div class="loading">正在连接探针…</div></div></div>
+
+  <div id="view-probes" style="display:none">
+    <div class="sec-title">拨测 <span style="font-size:12px;font-weight:400;color:var(--text-dim)" id="probeCount"></span></div>
+    <div id="probeList"><div class="probe-empty">暂无拨测任务，去 ⚙️管理 → 拨测任务 添加</div></div>
+  </div>
+
+  <div id="view-admin" style="display:none">
+    <div class="sec-title">⚙️ 管理</div>
+    <div class="atabs" id="atabs"></div>
+    <div id="atab-body"><div class="loading">加载中…</div></div>
+  </div>
+
+  <footer>🔭 Powered by <b>MyProbe</b> v{{ version }} · 主题 <b>波奇酱</b>（背景美术：jujiunofly，MIT）</footer>
+</div>
+<script>
+"use strict";
+/* ---------- 明暗切换 ---------- */
+var root = document.documentElement;
+try { root.dataset.theme = localStorage.getItem("bocchi-theme") || "light"; } catch(e){}
+function syncToggle(){ document.getElementById("themeToggle").textContent = root.dataset.theme === "dark" ? "☀️" : "🌙"; }
+syncToggle();
+document.getElementById("themeToggle").onclick = function(){
+  root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  try { localStorage.setItem("bocchi-theme", root.dataset.theme); } catch(e){}
+  syncToggle();
+};
+
+/* ---------- 视图切换 ---------- */
+var IS_ADMIN = false, curView = "board", curAtab = "nodes";
+document.querySelectorAll(".navbtn").forEach(function(a){
+  a.addEventListener("click", function(e){
+    e.preventDefault();
+    document.querySelectorAll(".navbtn").forEach(function(x){ x.classList.remove("on"); });
+    a.classList.add("on");
+    curView = a.dataset.v;
+    document.getElementById("view-board").style.display = curView === "board" ? "" : "none";
+    document.getElementById("view-probes").style.display = curView === "probes" ? "" : "none";
+    document.getElementById("view-admin").style.display = curView === "admin" ? "" : "none";
+    if (curView === "admin") renderAtabs();
+    window.scrollTo(0, 0);
+  });
+});
+
+/* ---------- 格式化 ---------- */
+function fmtRate(bps){
+  if (bps === null || bps === undefined || isNaN(bps)) return "—";
+  bps = Number(bps);
+  if (bps < 1024) return bps.toFixed(0) + " B/s";
+  if (bps < 1048576) return (bps/1024).toFixed(1) + " KB/s";
+  return (bps/1048576).toFixed(2) + " MB/s";
+}
+function fmtUptime(s){
+  if (s === null || s === undefined) return "—";
+  s = Math.floor(Number(s));
+  var d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
+  if (d > 0) return d + "天 " + h + "小时 " + m + "分";
+  if (h > 0) return h + "小时 " + m + "分";
+  return m + "分";
+}
+function esc(s){ return String(s === null || s === undefined ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function bar(pct){ pct = Math.max(0, Math.min(100, Number(pct) || 0)); return '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>'; }
+
+/* ---------- 节点卡片 ---------- */
+var openCharts = {};
+function nodeCard(n){
+  var off = !n.online;
+  var badge = "";
+  if (n.days_left !== null && n.days_left !== undefined){
+    var cls = n.days_left <= 7 ? "red" : (n.days_left <= 30 ? "yellow" : "");
+    badge = '<span class="badge ' + cls + '">余期' + n.days_left + '天</span>';
+  }
+  var memUsed = (n.mem !== null && n.mem_total) ? (n.mem/100*n.mem_total/1048576) : null;
+  var memTotal = n.mem_total ? (n.mem_total/1048576) : null;
+  var memVal = (memUsed !== null && memTotal) ? memUsed.toFixed(0) + "/" + memTotal.toFixed(0) + "MB" : "—";
+  var qhtml = "";
+  if (n.quota_gb && n.quota_gb > 0){
+    var pct = n.quota_pct || 0;
+    qhtml = '<div class="qline">📊 本月 ' + (n.quota_used_gb||0) + 'GB / ' + n.quota_gb + 'GB' +
+      '<div class="bar quota"><i style="width:' + Math.min(100,pct).toFixed(1) + '%"></i></div></div>';
+  }
+  var extra = "";
+  var tot = ((n.total_rx_gb||0) + (n.total_tx_gb||0));
+  if (tot > 0) extra += '<span>累计 <b>' + tot.toFixed(1) + ' GB</b></span>';
+  if (n.remain_value !== null && n.remain_value !== undefined) extra += '<span>余值 <b>¥' + n.remain_value + '</b></span>';
+  var sub = esc(n.hostname||"") + (n.os ? " · " + esc(n.os) : "") + " · " + (off ? "离线" : "在线");
+  return '<div class="card' + (off ? ' offline' : '') + '" data-nid="' + esc(n.id) + '">' +
+    '<div class="top"><span class="dot"></span><span class="name">' + esc(n.name) + '</span>' + badge + '</div>' +
+    '<div class="sub">' + sub + '</div>' +
+    '<div class="mrow"><span class="lb">CPU</span>' + bar(n.cpu) + '<span class="val">' + (n.cpu!==null?n.cpu.toFixed(1)+"%":"—") + '</span></div>' +
+    '<div class="mrow"><span class="lb">内存</span>' + bar(n.mem) + '<span class="val">' + (n.mem!==null?n.mem.toFixed(1)+"%":"—") + ' <small>' + memVal + '</small></span></div>' +
+    '<div class="mrow"><span class="lb">硬盘</span>' + bar(n.disk) + '<span class="val">' + (n.disk!==null?n.disk.toFixed(1)+"%":"—") + '</span></div>' +
+    '<div class="netline"><span>↓ <b>' + fmtRate(n.rx) + '</b></span><span>↑ <b>' + fmtRate(n.tx) + '</b></span><span>运行 <b>' + fmtUptime(n.uptime) + '</b></span>' + extra + '</div>' +
+    qhtml +
+    '<div class="detail"><div class="ranges">' +
+      ["1h","6h","24h","7d"].map(function(r){ return '<button data-r="'+r+'" class="'+((openCharts[n.id]||"1h")===r?"on":"")+'">'+r+'</button>'; }).join("") +
+    '</div><div class="chart-title">CPU / 内存 %</div><canvas class="chart" data-k="pct"></canvas>' +
+    '<div class="chart-title">上行 / 下行</div><canvas class="chart" data-k="net"></canvas>' +
+    '<div class="chart-title">📊 每日流量（近30天） <span class="daily-total" data-k="dtotal"></span></div><canvas class="chart" data-k="daily"></canvas></div>' +
+  '</div>';
+}
+
+/* ---------- 历史曲线 ---------- */
+function drawLine(cv, series, colors){
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w*dpr; cv.height = h*dpr;
+  var ctx = cv.getContext("2d"); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  var all = [];
+  series.forEach(function(s){ s.forEach(function(v){ if(v!==null&&v!==undefined) all.push(v); }); });
+  if (!all.length){ ctx.fillStyle="#a2657c"; ctx.font="12px sans-serif"; ctx.fillText("暂无数据",10,h/2); return; }
+  var max = Math.max.apply(null, all.concat([1]));
+  var n = series[0].length;
+  series.forEach(function(s, si){
+    ctx.beginPath(); ctx.strokeStyle = colors[si]; ctx.lineWidth = 1.6;
+    var started = false;
+    s.forEach(function(v,i){
+      var x = n<=1 ? 0 : i/(n-1)*w, y = h-4-(v/max)*(h-10);
+      if (v===null||v===undefined){ started=false; return; }
+      if (!started){ ctx.moveTo(x,y); started=true; } else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  });
+}
+/* v4：每日流量分组柱状图（粉色玻璃风） */
+function drawDailyBars(cv, days){
+  if (!cv || !days || !days.length) return;
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  cv.width = w*dpr; cv.height = h*dpr;
+  var ctx = cv.getContext("2d"); ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,w,h);
+  var padL = 34, padR = 6, padT = 6, padB = 16;
+  var iw = w - padL - padR, ih = h - padT - padB;
+  var mx = 1;
+  days.forEach(function(d){ mx = Math.max(mx, d.rx_gb||0, d.tx_gb||0); });
+  var Y = function(v){ return padT + ih - v/mx*ih; };
+  ctx.font = "10px sans-serif"; ctx.lineWidth = 1;
+  for (var g = 0; g <= 3; g++){
+    var v = mx*g/3, y = Y(v);
+    ctx.strokeStyle = "rgba(236,72,153,.18)"; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.fillStyle = "#a2657c"; ctx.fillText(v.toFixed(1), 2, y+3);
+  }
+  var n = days.length, slot = iw/n, bw = Math.max(2, slot*0.26);
+  days.forEach(function(d, i){
+    var x = padL + slot*i + slot/2;
+    ctx.fillStyle = "rgba(34,197,94,.85)";
+    var hrx = (d.rx_gb||0)/mx*ih; ctx.fillRect(x-bw-1, Y(d.rx_gb||0), bw, hrx);
+    ctx.fillStyle = "rgba(236,72,153,.9)";
+    var htx = (d.tx_gb||0)/mx*ih; ctx.fillRect(x+1, Y(d.tx_gb||0), bw, htx);
+    if (i % Math.ceil(n/8) === 0){ ctx.fillStyle = "#a2657c"; ctx.fillText(String(d.day).slice(5), x-11, h-3); }
+  });
+  ctx.font = "11px sans-serif";
+  ctx.fillStyle = "#22c55e"; ctx.fillRect(padL, 2, 9, 3);
+  ctx.fillStyle = "#a2657c"; ctx.fillText("下行", padL+12, 8);
+  ctx.fillStyle = "#ec4899"; ctx.fillRect(padL+48, 2, 9, 3);
+  ctx.fillStyle = "#a2657c"; ctx.fillText("上行", padL+60, 8);
+}
+/* v4：节点 id → 节点对象，供累计流量显示 */
+var nodesById = {};
+async function loadDetail(card, nid){
+  var range = openCharts[nid] || "1h";
+  try{
+    var r = await (await fetch("/api/history/" + encodeURIComponent(nid) + "?range=" + range)).json();
+    if (!r.ok) return;
+    drawLine(card.querySelector('canvas[data-k="pct"]'), [r.cpu, r.mem], ["#ec4899","#a855f7"]);
+    drawLine(card.querySelector('canvas[data-k="net"]'), [r.rx, r.tx], ["#22c55e","#3b82f6"]);
+    try{
+      var d = await (await fetch("/api/traffic/daily?node_id=" + encodeURIComponent(nid) + "&days=30")).json();
+      if (d.ok){
+        drawDailyBars(card.querySelector('canvas[data-k="daily"]'), d.days);
+        var nd = nodesById[nid];
+        if (nd){
+          var el = card.querySelector('[data-k="dtotal"]');
+          if (el) el.textContent = "累计 ↓ " + (nd.total_rx_gb||0) + " GB ↑ " + (nd.total_tx_gb||0) + " GB";
+        }
+      }
+    }catch(e2){}
+  }catch(e){}
+}
+document.getElementById("grid").addEventListener("click", function(e){
+  var btn = e.target.closest("button[data-r]");
+  var card = e.target.closest(".card");
+  if (!card || card.classList.contains("offline")) return;
+  var nid = card.dataset.nid;
+  if (btn){
+    openCharts[nid] = btn.dataset.r;
+    card.querySelectorAll(".ranges button").forEach(function(b){ b.classList.toggle("on", b===btn); });
+    loadDetail(card, nid);
+    e.stopPropagation();
+    return;
+  }
+  card.classList.toggle("open");
+  if (card.classList.contains("open")) setTimeout(function(){ loadDetail(card, nid); }, 30);
+});
+
+/* ---------- 拨测 ---------- */
+function probeHTML(t){
+  var lat = (t.latency===null||t.latency===undefined) ? "—" : Number(t.latency).toFixed(0) + " ms";
+  var loss = (t.loss===null||t.loss===undefined) ? "—" : Number(t.loss).toFixed(1) + "%";
+  var bars = (t.bars||[]).map(function(b){
+    var cls = "";
+    if (!b.ok) cls = "down";
+    else if ((b.loss||0) > 0) cls = "bad";
+    else if ((b.latency||0) > 300) cls = "warn";
+    return '<i class="'+cls+'"></i>';
+  }).join("");
+  return '<div class="probe"><div class="prow"><span class="pname">' + esc(t.name) + '</span>' +
+    '<span class="pmeta">' + esc(t.type) + ' · ' + esc(t.host) + '</span>' +
+    '<span class="plat">' + lat + '</span><span class="ploss">丢包 ' + loss + '</span></div>' +
+    '<div class="bars">' + bars + '</div></div>';
+}
+
+/* ---------- 主刷新 ---------- */
+async function refresh(){
+  try{
+    var r = await (await fetch("/api/nodes")).json();
+    var nodes = (r.nodes||[]).slice(); nodesById = {}; nodes.forEach(function(n){ nodesById[n.id]=n; }); nodes = nodes.sort(function(a,b){ return (b.online-a.online) || String(a.name).localeCompare(String(b.name)); });
+    var online = nodes.filter(function(n){return n.online;}).length;
+    document.getElementById("stateline").textContent =
+      "节点 " + nodes.length + " · 在线 " + online + " · 上报间隔 " + (r.interval||5) + "s";
+    var grid = document.getElementById("grid");
+    var openIds = {};
+    grid.querySelectorAll(".card.open").forEach(function(c){ openIds[c.dataset.nid]=1; });
+    grid.innerHTML = nodes.length ? nodes.map(nodeCard).join("") : '<div class="loading">暂无节点，先去装 agent 吧</div>';
+    Object.keys(openIds).forEach(function(nid){
+      var card = grid.querySelector('.card[data-nid="' + CSS.escape(nid) + '"]');
+      if (card && !card.classList.contains("offline")){ card.classList.add("open"); setTimeout(function(){ loadDetail(card, nid); }, 30); }
+    });
+  }catch(e){}
+  try{
+    var p = await (await fetch("/api/probes")).json();
+    var tasks = p.tasks || [];
+    document.getElementById("probeCount").textContent = tasks.length ? "（" + tasks.length + " 个任务）" : "";
+    document.getElementById("probeList").innerHTML = tasks.length
+      ? tasks.map(probeHTML).join("")
+      : '<div class="probe-empty">暂无拨测任务，去 ⚙️管理 → 拨测任务 添加</div>';
+  }catch(e){}
+}
+
+/* ================= 管理后台 ================= */
+var ATABS = [["nodes","🖥 节点信息"],["probes","📡 拨测任务"],["rules","🚨 告警规则"],
+  ["channels","🔔 通知渠道"],["alerts","📋 告警记录"],["themes","🎨 主题"],["plugins","🔌 插件"]];
+function renderAtabs(){
+  document.getElementById("atabs").innerHTML = ATABS.map(function(t){
+    return '<button class="' + (curAtab===t[0] ? "on" : "") + '" data-t="' + t[0] + '">' + t[1] + '</button>';
+  }).join("");
+  document.querySelectorAll("#atabs button").forEach(function(b){
+    b.onclick = function(){ curAtab = b.dataset.t; renderAtabs(); };
+  });
+  renderAtab();
+}
+async function apiAdmin(method, url, body, isForm){
+  var opt = {method: method};
+  if (isForm){ opt.body = body; }
+  else { opt.headers = {"Content-Type":"application/json"}; if (body) opt.body = JSON.stringify(body); }
+  return (await fetch(url, opt)).json();
+}
+async function renderAtab(){
+  var b = document.getElementById("atab-body");
+  b.innerHTML = '<div class="loading">加载中…</div>';
+  try{
+    if (curAtab==="nodes") return await tabNodes(b);
+    if (curAtab==="probes") return await tabProbes(b);
+    if (curAtab==="rules") return await tabRules(b);
+    if (curAtab==="channels") return await tabChannels(b);
+    if (curAtab==="alerts") return await tabAlerts(b);
+    if (curAtab==="themes") return await tabThemes(b);
+    if (curAtab==="plugins") return await tabPlugins(b);
+  }catch(e){ b.innerHTML = '<div class="probe-empty">加载失败：' + esc(e.message||e) + '</div>'; }
+}
+/* ---- 节点信息 ---- */
+async function tabNodes(b){
+  var r = await (await fetch("/api/nodes")).json();
+  var nodes = r.nodes || [];
+  if (!nodes.length){ b.innerHTML = '<div class="probe-empty">暂无节点</div>'; return; }
+  b.innerHTML = nodes.map(function(n){
+    return '<div class="frm" id="meta-' + esc(n.id) + '">' +
+      '<h3>' + esc(n.name) + ' <small>' + esc(n.id) + '</small></h3>' +
+      '<div class="row2"><div><label>显示名称</label><input data-k="name" value="' + esc(n.name) + '"></div>' +
+      '<div><label>套餐价格</label><input data-k="price" value="' + (n.price==null?"":n.price) + '" placeholder="如 249"></div></div>' +
+      '<div class="row2"><div><label>货币符号</label><input data-k="currency" value="' + esc(n.currency||"¥") + '"></div>' +
+      '<div><label>计费周期</label><select data-k="bill_cycle"><option value="">—</option>' +
+      '<option value="monthly"' + (n.bill_cycle==="monthly"?" selected":"") + '>月付</option>' +
+      '<option value="yearly"' + (n.bill_cycle==="yearly"?" selected":"") + '>年付</option></select></div></div>' +
+      '<div class="row2"><div><label>月流量配额 (GB)</label><input data-k="quota_gb" value="' + (n.quota_gb==null?"":n.quota_gb) + '" placeholder="如 820"></div>' +
+      '<div><label>　</label><div></div></div></div>' +
+      '<div class="row2"><div><label>购买日期</label><input data-k="buy_date" type="date" value="' + esc(n.buy_date||"") + '"></div>' +
+      '<div><label>到期日期</label><input data-k="expire_date" type="date" value="' + esc(n.expire_date||"") + '"></div></div>' +
+      '<div class="btnrow"><button class="btn" onclick="saveNodeMeta(\'' + esc(n.id) + '\')">💾 保存</button>' +
+      '<button class="btn danger" onclick="delNode(\'' + esc(n.id) + '\')">🗑 删除节点</button>' +
+      '<span class="note" id="meta-msg-' + esc(n.id) + '"></span></div></div>';
+  }).join("");
+}
+async function saveNodeMeta(id){
+  var box = document.getElementById("meta-" + id);
+  var d = {};
+  box.querySelectorAll("[data-k]").forEach(function(el){ d[el.dataset.k] = el.value.trim(); });
+  var name = d.name; delete d.name;
+  var msg = document.getElementById("meta-msg-" + id);
+  var r1 = await apiAdmin("POST", "/api/admin/node/" + encodeURIComponent(id) + "/rename", {name: name});
+  var r2 = await apiAdmin("PUT", "/api/admin/node/" + encodeURIComponent(id) + "/meta", d);
+  if (r1.ok && r2.ok){ msg.textContent = "✅ 已保存"; refresh(); }
+  else msg.textContent = "❌ " + ((r1.error||"") + " " + (r2.error||""));
+}
+async function delNode(id){
+  if (!confirm("确定删除节点 " + id + " 及其历史数据吗？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/node/" + encodeURIComponent(id));
+  if (r.ok){ renderAtab(); refresh(); } else alert("删除失败：" + (r.error||""));
+}
+/* ---- 拨测任务 ---- */
+function probeForm(t){
+  t = t || {name:"", type:"ping", host:"", port:53, path:"", interval:60, enabled:1};
+  document.getElementById("probe-form").innerHTML =
+    '<div class="row2"><div><label>任务名称</label><input id="pf-name" value="' + esc(t.name) + '" placeholder="如 浙江移动"></div>' +
+    '<div><label>类型</label><select id="pf-type" onchange="pfType()">' +
+    ["ping","tcp","http"].map(function(x){ return '<option' + (t.type===x?" selected":"") + '>'+x+'</option>'; }).join("") +
+    '</select></div></div>' +
+    '<label>目标 host（ping/tcp 填 IP 或域名；http 填完整 URL 或域名）</label>' +
+    '<input id="pf-host" value="' + esc(t.host) + '" placeholder="如 223.5.5.5 或 https://www.10010.com">' +
+    '<div class="row2"><div id="pf-port-w"><label>TCP 端口</label><input id="pf-port" type="number" value="' + (t.port||53) + '"></div>' +
+    '<div id="pf-path-w"><label>HTTP 路径（可空）</label><input id="pf-path" value="' + esc(t.path||"") + '"></div></div>' +
+    '<div class="row2"><div><label>探测间隔（秒）</label><input id="pf-interval" type="number" value="' + (t.interval||60) + '"></div>' +
+    '<div><label>状态</label><select id="pf-enabled"><option value="1"' + (t.enabled?" selected":"") + '>启用</option>' +
+    '<option value="0"' + (t.enabled?"":" selected") + '>停用</option></select></div></div>' +
+    '<div class="note">ping 用系统 ping 测 4 次取平均；tcp 测端口连通耗时；http 测 GET 耗时。</div>';
+  pfType();
+}
+function pfType(){
+  var t = document.getElementById("pf-type").value;
+  document.getElementById("pf-port-w").style.display = t==="tcp" ? "" : "none";
+  document.getElementById("pf-path-w").style.display = t==="http" ? "" : "none";
+}
+async function tabProbes(b){
+  var r = await apiAdmin("GET", "/api/admin/probes");
+  var tasks = r.tasks || [];
+  b.innerHTML = '<div class="tblwrap"><table class="tbl"><tr><th>名称</th><th>类型</th><th>目标</th><th>间隔</th><th>状态</th><th>操作</th></tr>' +
+    tasks.map(function(t){
+      return '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.type) + '</td>' +
+      '<td class="dim">' + esc(t.host) + (t.type==="tcp"&&t.port?":"+t.port:"") + (t.type==="http"&&t.path?esc(t.path):"") + '</td>' +
+      '<td>' + t.interval + 's</td><td>' + (t.enabled?"启用":"停用") + '</td>' +
+      '<td><button class="btn sm" onclick="editProbe(' + t.id + ')">编辑</button> ' +
+      '<button class="btn sm danger" onclick="delProbe(' + t.id + ')">删除</button></td></tr>';
+    }).join("") + '</table></div>' +
+    '<div class="frm"><h3>➕ 添加拨测任务</h3><div id="probe-form"></div>' +
+    '<button class="btn" onclick="saveProbe(null)">添加</button></div>';
+  probeForm(null);
+}
+async function saveProbe(id){
+  var d = {name: document.getElementById("pf-name").value.trim(), type: document.getElementById("pf-type").value,
+    host: document.getElementById("pf-host").value.trim(), port: document.getElementById("pf-port").value,
+    path: document.getElementById("pf-path").value.trim(), interval: document.getElementById("pf-interval").value,
+    enabled: document.getElementById("pf-enabled").value === "1"};
+  var r = id == null ? await apiAdmin("POST", "/api/admin/probes", d)
+                     : await apiAdmin("PUT", "/api/admin/probes/" + id, d);
+  if (r.ok) renderAtab(); else alert("保存失败：" + (r.error||""));
+}
+async function editProbe(id){
+  var r = await apiAdmin("GET", "/api/admin/probes");
+  var t = (r.tasks||[]).find(function(x){ return x.id === id; });
+  if (!t) return;
+  var b = document.getElementById("atab-body");
+  b.innerHTML = '<div class="frm"><h3>✏️ 编辑拨测任务</h3><div id="probe-form"></div>' +
+    '<div class="btnrow"><button class="btn" onclick="saveProbe(' + id + ')">保存</button>' +
+    '<button class="btn ghost" onclick="renderAtab()">取消</button></div></div>';
+  probeForm(t);
+  window.scrollTo(0,0);
+}
+async function delProbe(id){
+  if (!confirm("确定删除该拨测任务及其历史结果吗？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/probes/" + id);
+  if (r.ok) renderAtab(); else alert("删除失败：" + (r.error||""));
+}
+/* ---- 告警规则 ---- */
+var METRIC_LABEL = {cpu:"CPU%", mem:"内存%", offline:"节点离线"};
+async function tabRules(b){
+  var r = await apiAdmin("GET", "/api/admin/rules");
+  var rules = r.rules || [];
+  b.innerHTML = '<div class="tblwrap"><table class="tbl"><tr><th>规则</th><th>条件</th><th>持续</th><th>状态</th><th>操作</th></tr>' +
+    (rules.map(function(x){
+      return '<tr><td>' + esc(x.name) + '</td><td>' + (METRIC_LABEL[x.metric]||x.metric) +
+        (x.metric==="offline" ? "" : " ≥ " + x.threshold + "%") + '</td><td>' + x.duration + ' 分钟</td>' +
+        '<td>' + (x.enabled?"启用":"停用") + '</td>' +
+        '<td><button class="btn sm danger" onclick="delRule(' + x.id + ')">删除</button></td></tr>';
+    }).join("") || '<tr><td colspan="5" class="dim">暂无规则</td></tr>') + '</table></div>' +
+    '<div class="frm"><h3>➕ 添加告警规则</h3>' +
+    '<div class="row2"><div><label>规则名称</label><input id="rf-name" placeholder="如 CPU 过高告警"></div>' +
+    '<div><label>指标</label><select id="rf-metric" onchange="rfMetric()">' +
+    '<option value="cpu">CPU%</option><option value="mem">内存%</option><option value="offline">节点离线</option></select></div></div>' +
+    '<div class="row2"><div id="rf-thr-w"><label>阈值 %</label><input id="rf-thr" type="number" value="90"></div>' +
+    '<div><label>持续 N 分钟后告警（0=立即）</label><input id="rf-dur" type="number" value="5"></div></div>' +
+    '<button class="btn" onclick="saveRule()">添加</button>' +
+    '<div class="note">同一事件只告警一次，恢复后会发一条恢复通知。</div></div>';
+}
+function rfMetric(){ document.getElementById("rf-thr-w").style.display = document.getElementById("rf-metric").value==="offline" ? "none" : ""; }
+async function saveRule(){
+  var d = {name: document.getElementById("rf-name").value.trim(), metric: document.getElementById("rf-metric").value,
+    threshold: document.getElementById("rf-thr").value, duration: document.getElementById("rf-dur").value, enabled: true};
+  var r = await apiAdmin("POST", "/api/admin/rules", d);
+  if (r.ok) renderAtab(); else alert("保存失败：" + (r.error||""));
+}
+async function delRule(id){
+  if (!confirm("确定删除该告警规则吗？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/rules/" + id);
+  if (r.ok) renderAtab(); else alert("删除失败：" + (r.error||""));
+}
+/* ---- 通知渠道 ---- */
+var CTYPE_LABEL = {webhook:"Webhook", telegram:"Telegram", email:"邮件"};
+function channelFields(type, cfg){
+  cfg = cfg || {};
+  function inp(k, label, ph, pw){
+    return '<div><label>' + label + '</label><input data-k="' + k + '" type="' + (pw?"password":"text") +
+      '" value="' + esc(cfg[k]==null?"":cfg[k]) + '" placeholder="' + (ph||"") + '"></div>';
+  }
+  if (type === "webhook") return inp("url", "Webhook 地址（POST JSON）", "https://...");
+  if (type === "telegram") return inp("bot_token", "Bot Token", "123456:ABC...", true) + inp("chat_id", "Chat ID", "123456789");
+  return '<div class="row2">' + inp("smtp_host","SMTP 服务器","smtp.resend.com") + inp("smtp_port","SMTP 端口","587") + '</div>' +
+    '<div class="row2">' + inp("username","SMTP 用户名","") + inp("password","SMTP 密码 / 授权码","",true) + '</div>' +
+    '<div class="row2">' + inp("from","发件人（可空=用户名）","") + inp("to","收件人（逗号分隔）","a@b.com") + '</div>';
+}
+async function tabChannels(b){
+  var r = await apiAdmin("GET", "/api/admin/channels");
+  var chs = r.channels || [];
+  b.innerHTML = '<div class="tblwrap"><table class="tbl"><tr><th>名称</th><th>类型</th><th>状态</th><th>操作</th></tr>' +
+    (chs.map(function(c){
+      return '<tr><td>' + esc(c.name) + '</td><td>' + (CTYPE_LABEL[c.type]||c.type) + '</td>' +
+        '<td>' + (c.enabled?"启用":"停用") + '</td>' +
+        '<td><button class="btn sm" onclick="testChannel(' + c.id + ')">测试</button> ' +
+        '<button class="btn sm danger" onclick="delChannel(' + c.id + ')">删除</button></td></tr>';
+    }).join("") || '<tr><td colspan="4" class="dim">暂无渠道（不配置则告警只记日志）</td></tr>') + '</table></div>' +
+    '<div class="frm"><h3>➕ 添加通知渠道</h3>' +
+    '<div class="row2"><div><label>名称</label><input id="cf-name" placeholder="如 我的TG"></div>' +
+    '<div><label>类型</label><select id="cf-type" onchange="cfType()">' +
+    '<option value="webhook">Webhook</option><option value="telegram">Telegram</option><option value="email">邮件</option></select></div></div>' +
+    '<div id="cf-fields"></div><button class="btn" onclick="saveChannel()">添加</button>' +
+    '<div class="note">Webhook 会 POST JSON：{"text": "告警内容", "source": "myprobe", "time": 时间戳}。</div></div>';
+  cfType();
+}
+function cfType(){ document.getElementById("cf-fields").innerHTML = channelFields(document.getElementById("cf-type").value, {}); }
+async function saveChannel(){
+  var cfg = {};
+  document.querySelectorAll("#cf-fields [data-k]").forEach(function(el){ cfg[el.dataset.k] = el.value.trim(); });
+  var d = {name: document.getElementById("cf-name").value.trim(), type: document.getElementById("cf-type").value, config: cfg, enabled: true};
+  var r = await apiAdmin("POST", "/api/admin/channels", d);
+  if (r.ok) renderAtab(); else alert("保存失败：" + (r.error||""));
+}
+async function testChannel(id){
+  var r = await apiAdmin("POST", "/api/admin/channels/" + id + "/test");
+  alert(r.ok ? "✅ 测试通知已发送，请查收" : "❌ " + (r.error||"发送失败"));
+}
+async function delChannel(id){
+  if (!confirm("确定删除该通知渠道吗？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/channels/" + id);
+  if (r.ok) renderAtab(); else alert("删除失败：" + (r.error||""));
+}
+/* ---- 告警记录 ---- */
+async function tabAlerts(b){
+  var r = await apiAdmin("GET", "/api/admin/alerts");
+  var list = r.alerts || [];
+  b.innerHTML = list.length
+    ? '<div class="tblwrap"><table class="tbl"><tr><th>时间</th><th>类型</th><th>内容</th></tr>' +
+      list.map(function(a){
+        return '<tr><td style="white-space:nowrap">' + new Date(a.ts*1000).toLocaleString("zh-CN") + '</td>' +
+          '<td>' + (a.level==="firing" ? "🚨 告警" : "✅ 恢复") + '</td>' +
+          '<td style="white-space:pre-wrap">' + esc(a.message) + '</td></tr>';
+      }).join("") + '</table></div>'
+    : '<div class="probe-empty">暂无告警记录</div>';
+}
+/* ---- 主题 ---- */
+async function tabThemes(b){
+  var r = await apiAdmin("GET", "/api/admin/themes");
+  var ts = r.themes || [];
+  b.innerHTML = '<div class="tblwrap"><table class="tbl"><tr><th>主题</th><th>版本</th><th>作者</th><th>状态</th><th>操作</th></tr>' +
+    ts.map(function(t){
+      return '<tr><td>' + esc(t.name) + '<br><small class="dim">' + esc(t.id) + '</small></td>' +
+        '<td>' + esc(t.version||"") + '</td><td class="dim">' + esc(t.author||"") + '</td>' +
+        '<td>' + (t.active?'<span class="badge">使用中</span>':"") + (t.builtin?' <span class="badge">内建</span>':"") + '</td><td>' +
+        (t.active ? "" : '<button class="btn sm" onclick="activateTheme(\'' + esc(t.id) + '\')">启用</button> ') +
+        ((!t.active && !t.builtin) ? '<button class="btn sm danger" onclick="delTheme(\'' + esc(t.id) + '\')">删除</button>' : "") +
+        '</td></tr>';
+    }).join("") + '</table></div>' +
+    '<div class="frm"><h3>⬆️ 上传主题（zip 包）</h3>' +
+    '<input type="file" id="theme-file" accept=".zip" style="margin-bottom:10px">' +
+    '<div><button class="btn" onclick="uploadTheme()">上传</button></div>' +
+    '<div class="note">zip 内必须包含 theme.json。主题目录结构：theme.json / templates/dashboard.html / static/（经 /theme-static/&lt;id&gt;/ 访问）。</div></div>';
+}
+async function uploadTheme(){
+  var f = document.getElementById("theme-file").files[0];
+  if (!f) return alert("请先选择 zip 文件");
+  var fd = new FormData(); fd.append("file", f);
+  var r = await (await fetch("/api/admin/themes/upload", {method:"POST", body:fd})).json();
+  if (!r.ok) return alert("上传失败：" + (r.error||"未知错误"));
+  renderAtab();
+}
+async function activateTheme(id){
+  var r = await apiAdmin("POST", "/api/admin/themes/" + encodeURIComponent(id) + "/activate");
+  if (!r.ok) return alert("启用失败：" + (r.error||""));
+  location.reload();
+}
+async function delTheme(id){
+  if (!confirm("确定删除主题 " + id + "？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/themes/" + encodeURIComponent(id));
+  if (!r.ok) return alert("删除失败：" + (r.error||""));
+  renderAtab();
+}
+/* ---- 插件 ---- */
+async function tabPlugins(b){
+  var r = await apiAdmin("GET", "/api/admin/plugins");
+  var ps = r.plugins || [];
+  b.innerHTML = '<div class="frm warnbox"><h3>⚠️ 安全提醒</h3><div class="note">插件是以服务端代码运行的，只安装信任来源的插件。</div></div>' +
+    '<div class="tblwrap"><table class="tbl"><tr><th>插件</th><th>版本</th><th>钩子</th><th>状态</th><th>操作</th></tr>' +
+    ps.map(function(p){
+      return '<tr><td>' + esc(p.name) + '<br><small class="dim">' + esc(p.id) + '</small></td>' +
+        '<td>' + esc(p.version||"") + '</td><td><small class="dim">' + esc((p.hooks||[]).join(", ")) + '</small></td>' +
+        '<td>' + (p.enabled?'<span class="badge">已启用</span>':'<span class="badge">已停用</span>') + '</td><td>' +
+        '<button class="btn sm" onclick="togglePlugin(\'' + esc(p.id) + '\',' + (p.enabled?0:1) + ')">' + (p.enabled?"停用":"启用") + '</button> ' +
+        '<button class="btn sm danger" onclick="delPlugin(\'' + esc(p.id) + '\')">删除</button></td></tr>';
+    }).join("") + '</table></div>' +
+    '<div class="frm"><h3>⬆️ 上传插件（zip 包）</h3>' +
+    '<input type="file" id="plugin-file" accept=".zip" style="margin-bottom:10px">' +
+    '<div class="btnrow"><button class="btn" onclick="uploadPlugin()">上传</button>' +
+    '<button class="btn ghost" onclick="reloadPlugins()">🔄 重新加载</button></div>' +
+    '<div class="note">zip 内必须包含 plugin.json + plugin.py。</div></div>';
+}
+async function uploadPlugin(){
+  var f = document.getElementById("plugin-file").files[0];
+  if (!f) return alert("请先选择 zip 文件");
+  var fd = new FormData(); fd.append("file", f);
+  var r = await (await fetch("/api/admin/plugins/upload", {method:"POST", body:fd})).json();
+  if (!r.ok) return alert("上传失败：" + (r.error||"未知错误"));
+  renderAtab();
+}
+async function togglePlugin(id, on){
+  var r = await apiAdmin("POST", "/api/admin/plugins/" + encodeURIComponent(id) + "/" + (on?"enable":"disable"));
+  if (!r.ok) return alert("操作失败：" + (r.error||""));
+  renderAtab();
+}
+async function reloadPlugins(){
+  var r = await apiAdmin("POST", "/api/admin/plugins/reload");
+  alert(r.ok ? "已重载 " + r.count + " 个插件" : "重载失败：" + (r.error||""));
+  renderAtab();
+}
+async function delPlugin(id){
+  if (!confirm("确定删除插件 " + id + "？")) return;
+  var r = await apiAdmin("DELETE", "/api/admin/plugins/" + encodeURIComponent(id));
+  if (!r.ok) return alert("删除失败：" + (r.error||""));
+  renderAtab();
+}
+
+/* ---------- 启动 ---------- */
+(async function(){
+  try{ var me = await (await fetch("/api/me")).json(); if (me.admin){ IS_ADMIN = true; document.getElementById("adminNav").style.display=""; } }catch(e){}
+  await refresh();
+  setInterval(function(){ if (curView !== "admin") refresh(); }, 5000);
+})();
+</script>
+</body>
+</html>
