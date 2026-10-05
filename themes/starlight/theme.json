@@ -1,1 +1,8 @@
-{"id": "starlight", "name": "星光", "version": "1.0.0", "author": "MyProbe", "description": "深空星野风：星空底、玻璃拟态节点卡片、探测目标延迟/丢包条形图。布局灵感来自 Komari Starlight 主题。"}
+{
+  "id": "starlight",
+  "name": "星光",
+  "version": "1.1.0",
+  "author": "MyProbe",
+  "description": "深空星野风：星空底、玻璃拟态节点卡片、探测目标延迟/丢包条形图。布局灵感来自 Komari Starlight 主题。",
+  "changelog": "加拨测任务⚡即时测试按钮（需服务端 v6.2+）。"
+}

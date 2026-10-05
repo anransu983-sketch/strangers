@@ -3,5 +3,6 @@
   "description": "波奇酱粉色外观 × 星空布局：粉色玻璃卡片、波奇酱壁纸（明暗/桌面手机自适应）、星空式节点卡片与拨测条形图。背景美术：jujiunofly（MIT）。背景图来源：https://github.com/jujiunofly/komari-theme-Bocchi。",
   "id": "bocchi-starlight",
   "name": "波奇酱·星空",
-  "version": "1.0.12"
+  "version": "1.0.13",
+  "changelog": "加拨测任务⚡即时测试按钮（需服务端 v6.2+）。"
 }

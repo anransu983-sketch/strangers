@@ -441,7 +441,8 @@ async function tabProbes(b){
       return '<tr><td>' + esc(t.name) + '</td><td>' + esc(t.type) + '</td>' +
       '<td class="dim">' + esc(t.host) + (t.type==="tcp"&&t.port?":"+t.port:"") + (t.type==="http"&&t.path?esc(t.path):"") + '</td>' +
       '<td>' + t.interval + 's</td><td>' + (t.enabled?"启用":"停用") + '</td>' +
-      '<td><button class="btn sm" onclick="editProbe(' + t.id + ')">编辑</button> ' +
+      '<td><button class="btn sm" onclick="testProbe(' + t.id + ')">⚡测试</button> ' +
+      '<button class="btn sm" onclick="editProbe(' + t.id + ')">编辑</button> ' +
       '<button class="btn sm danger" onclick="delProbe(' + t.id + ')">删除</button></td></tr>';
     }).join("") + '</table></div>' +
     '<div class="frm"><h3>➕ 添加拨测任务</h3><div id="probe-form"></div>' +
@@ -472,6 +473,20 @@ async function delProbe(id){
   if (!confirm("确定删除该拨测任务及其历史结果吗？")) return;
   var r = await apiAdmin("DELETE", "/api/admin/probes/" + id);
   if (r.ok) renderAtab(); else alert("删除失败：" + (r.error||""));
+}
+/* v6.2：服务端即时测试拨测任务（服务端视角，各节点结果仍走 agent 周期） */
+async function testProbe(id){
+  var btn = event && event.target ? event.target : null;
+  if (btn) { btn.disabled = true; btn.textContent = "⏳…"; }
+  try {
+    var r = await apiAdmin("POST", "/api/admin/probes/" + id + "/test");
+    if (!r.ok) { alert("测试失败：" + (r.error||"")); return; }
+    alert(r.reachable
+      ? "✅ " + r.name + "\n服务端即时测试：延迟 " + r.latency + " ms，丢包 " + r.loss + "%\n（各节点独立结果将在 60 秒内出现在拨测页）"
+      : "❌ " + r.name + "\n服务端即时测试：不通（丢包 " + r.loss + "%），请检查目标地址/端口");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "⚡测试"; }
+  }
 }
 /* ---- 告警规则 ---- */
 var METRIC_LABEL = {cpu:"CPU%", mem:"内存%", offline:"节点离线"};
