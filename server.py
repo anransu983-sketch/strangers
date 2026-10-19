@@ -1947,14 +1947,15 @@ async function testProbe(id){
 }
 
 // ---- 告警规则 ----
-const METRIC_LABEL = {cpu: "CPU%", mem: "内存%", offline: "节点离线"};
+const METRIC_LABEL = {cpu: "CPU%", mem: "内存%", offline: "节点离线", traffic_day: "单日流量", traffic_month: "月累计流量"};
+const METRIC_UNIT = {cpu: "%", mem: "%", traffic_day: "GB", traffic_month: "GB"};
 async function tabRules(b){
   const r = await apiAdmin("GET", "/api/admin/rules");
   const rules = r.rules || [];
   b.innerHTML = `<table class="tbl"><tr><th>规则</th><th>条件</th><th>持续</th><th>状态</th><th>操作</th></tr>` +
     (rules.map(x => `<tr>
       <td>${esc(x.name)}</td>
-      <td>${METRIC_LABEL[x.metric] || x.metric}${x.metric === "offline" ? "" : " ≥ " + x.threshold + "%"}</td>
+      <td>${METRIC_LABEL[x.metric] || x.metric}${x.metric === "offline" ? "" : " ≥ " + x.threshold + (METRIC_UNIT[x.metric] || "")}</td>
       <td>${x.duration} 分钟</td><td>${x.enabled ? "启用" : "停用"}</td>
       <td><button class="btn sm danger" onclick="delRule(${x.id})">删除</button></td>
     </tr>`).join("") || `<tr><td colspan="5" style="color:var(--dim)">暂无规则</td></tr>`) + `</table>
@@ -1962,11 +1963,11 @@ async function tabRules(b){
       <div class="row2">
         <div><label>规则名称</label><input id="rf-name" placeholder="如 CPU 过高告警"></div>
         <div><label>指标</label><select id="rf-metric" onchange="rfMetric()">
-          <option value="cpu">CPU%</option><option value="mem">内存%</option><option value="offline">节点离线</option>
+          <option value="cpu">CPU%</option><option value="mem">内存%</option><option value="offline">节点离线</option><option value="traffic_day">单日流量</option><option value="traffic_month">月累计流量</option>
         </select></div>
       </div>
       <div class="row2">
-        <div id="rf-thr-w"><label>阈值 %</label><input id="rf-thr" type="number" value="90"></div>
+        <div id="rf-thr-w"><label id="rf-thr-lab">阈值 %</label><input id="rf-thr" type="number" value="90"></div>
         <div><label>持续 N 分钟后告警（0=立即）</label><input id="rf-dur" type="number" value="5"></div>
       </div>
       <button class="btn" onclick="saveRule()">添加</button>
@@ -1975,7 +1976,9 @@ async function tabRules(b){
 }
 
 function rfMetric(){
-  $("rf-thr-w").style.display = $("rf-metric").value === "offline" ? "none" : "";
+  const m = $("rf-metric").value;
+  $("rf-thr-w").style.display = m === "offline" ? "none" : "";
+  $("rf-thr-lab").textContent = (m === "traffic_day" || m === "traffic_month") ? "阈值 GB" : "阈值 %";
 }
 
 async function saveRule(){
@@ -2462,6 +2465,8 @@ def admin_node_meta(nid):
 def eval_rule(db, rule, node, now):
     """评估单条规则对单个节点是否触发。返回 (触发?, 描述)。"""
     metric = rule["metric"]
+    if metric in ("traffic_day", "traffic_month"):
+        return eval_traffic_rule(db, rule, node, now)
     if metric == "offline":
         last = node["last_seen"] or 0
         if last and now - last >= OFFLINE_AFTER:
@@ -2476,6 +2481,28 @@ def eval_rule(db, rule, node, now):
     label = "CPU" if metric == "cpu" else "内存"
     if v is not None and v >= (rule["threshold"] or 0):
         return True, f"{label} {v:.1f}% ≥ {rule['threshold']}%"
+    return False, ""
+
+def eval_traffic_rule(db, rule, node, now):
+    """流量型规则：traffic_day=单日累计GB，traffic_month=月累计GB。返回 (触发?, 描述)。"""
+    metric = rule["metric"]
+    if metric == "traffic_day":
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        row = db.execute(
+            "SELECT rx_bytes, tx_bytes FROM traffic_daily WHERE node_id=? AND day=?",
+            (node["id"], day)).fetchone()
+        label = "今日流量"
+    else:
+        month = time.strftime("%Y-%m", time.localtime(now))
+        row = db.execute(
+            "SELECT rx_bytes, tx_bytes FROM traffic_monthly WHERE node_id=? AND month=?",
+            (node["id"], month)).fetchone()
+        label = "本月流量"
+    total = ((row["rx_bytes"] or 0) + (row["tx_bytes"] or 0)) if row else 0
+    gb = total / (1024 ** 3)
+    th = rule["threshold"] or 0
+    if gb >= th:
+        return True, f"{label} {gb:.2f}GB ≥ {th:g}GB"
     return False, ""
 
 def send_webhook(cfg, text):
@@ -2631,8 +2658,8 @@ def admin_rule_create():
     metric = (d.get("metric") or "").strip()
     if not name or len(name) > 64:
         return jsonify({"ok": False, "error": "规则名称不能为空（64字符内）"}), 400
-    if metric not in ("cpu", "mem", "offline"):
-        return jsonify({"ok": False, "error": "指标只能是 cpu / mem / offline"}), 400
+    if metric not in ("cpu", "mem", "offline", "traffic_day", "traffic_month"):
+        return jsonify({"ok": False, "error": "指标只能是 cpu / mem / offline / traffic_day / traffic_month"}), 400
     try:
         threshold = float(d.get("threshold") or 0)
         duration = int(d.get("duration") or 0)
@@ -2640,6 +2667,8 @@ def admin_rule_create():
         return jsonify({"ok": False, "error": "阈值/持续时间必须是数字"}), 400
     if metric in ("cpu", "mem") and not 1 <= threshold <= 100:
         return jsonify({"ok": False, "error": "CPU/内存阈值需在 1~100 之间"}), 400
+    if metric in ("traffic_day", "traffic_month") and not 0.1 <= threshold <= 1000000:
+        return jsonify({"ok": False, "error": "流量阈值需在 0.1~1000000 GB 之间"}), 400
     if not 0 <= duration <= 1440:
         return jsonify({"ok": False, "error": "持续时间需在 0~1440 分钟之间"}), 400
     db = get_db()
@@ -2656,13 +2685,17 @@ def admin_rule_update(rid):
     d = request.get_json(silent=True) or {}
     name = (d.get("name") or "").strip()
     metric = (d.get("metric") or "").strip()
-    if not name or metric not in ("cpu", "mem", "offline"):
+    if not name or metric not in ("cpu", "mem", "offline", "traffic_day", "traffic_month"):
         return jsonify({"ok": False, "error": "参数不合法"}), 400
     try:
         threshold = float(d.get("threshold") or 0)
         duration = int(d.get("duration") or 0)
     except Exception:
         return jsonify({"ok": False, "error": "阈值/持续时间必须是数字"}), 400
+    if metric in ("cpu", "mem") and not 1 <= threshold <= 100:
+        return jsonify({"ok": False, "error": "CPU/内存阈值需在 1~100 之间"}), 400
+    if metric in ("traffic_day", "traffic_month") and not 0.1 <= threshold <= 1000000:
+        return jsonify({"ok": False, "error": "流量阈值需在 0.1~1000000 GB 之间"}), 400
     db = get_db()
     cur = db.execute(
         "UPDATE alert_rules SET name=?, metric=?, threshold=?, duration=?, enabled=?"
