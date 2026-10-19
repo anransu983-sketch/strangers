@@ -902,41 +902,54 @@ def _ssh_reaper():
 @app.route("/api/admin/ssh/connect", methods=["POST"])
 @login_required
 def admin_ssh_connect():
-    """建立 SSH 会话。password 为一次性密码（不保存）；不传则用已存密码。"""
+    """建立 SSH 会话。password 为一次性密码（不保存）；不传则用已存密码。
+    传 host 时直连任意主机（App「快速连接」用）；否则按 node_id 查节点配置。"""
     try:
         import paramiko
     except ImportError:
         return jsonify({"ok": False, "error": "服务端未安装 paramiko，请先 pip install -r requirements.txt"}), 500
     d = request.get_json(silent=True) or {}
-    nid = (d.get("node_id") or "").strip()
-    if not valid_node_id(nid):
-        return jsonify({"ok": False, "error": "node_id 不合法"}), 400
-    db = get_db()
-    try:
-        row = db.execute(
-            "SELECT id, name, ssh_host, ssh_port, ssh_user, ssh_pass_enc"
-            " FROM nodes WHERE id=?", (nid,)).fetchone()
-    except Exception:
-        row = db.execute(
-            "SELECT id, name, ssh_host, ssh_port, ssh_user FROM nodes WHERE id=?",
-            (nid,)).fetchone()
-    if row is None:
-        return jsonify({"ok": False, "error": "节点不存在"}), 404
-    host = (row["ssh_host"] or "").strip()
-    if not host:
-        return jsonify({"ok": False, "error": "该节点未配置 SSH 主机"}), 400
-    port = _clamp_int(row["ssh_port"], 1, 65535, 22)
-    user = (row["ssh_user"] or "").strip() or "root"
-    pw = d.get("password") or ""
-    if not pw:
-        enc = row["ssh_pass_enc"] if "ssh_pass_enc" in row.keys() else ""
-        if enc:
-            try:
-                pw = decrypt_pass(enc)
-            except Exception:
-                return jsonify({"ok": False, "error": "已存密码解密失败（CRED_KEY 可能已变更），请重新保存密码"}), 400
-    if not pw:
-        return jsonify({"ok": False, "error": "请输入 SSH 密码"}), 400
+    custom_host = (d.get("host") or "").strip()
+    if custom_host:
+        # 直连任意主机
+        host = custom_host
+        port = _clamp_int(d.get("port"), 1, 65535, 22)
+        user = (d.get("username") or "").strip() or "root"
+        pw = d.get("password") or ""
+        if not pw:
+            return jsonify({"ok": False, "error": "请输入 SSH 密码"}), 400
+        nid, name = "custom", f"{user}@{host}"
+    else:
+        nid = (d.get("node_id") or "").strip()
+        if not valid_node_id(nid):
+            return jsonify({"ok": False, "error": "node_id 不合法"}), 400
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT id, name, ssh_host, ssh_port, ssh_user, ssh_pass_enc"
+                " FROM nodes WHERE id=?", (nid,)).fetchone()
+        except Exception:
+            row = db.execute(
+                "SELECT id, name, ssh_host, ssh_port, ssh_user FROM nodes WHERE id=?",
+                (nid,)).fetchone()
+        if row is None:
+            return jsonify({"ok": False, "error": "节点不存在"}), 404
+        host = (row["ssh_host"] or "").strip()
+        if not host:
+            return jsonify({"ok": False, "error": "该节点未配置 SSH 主机"}), 400
+        port = _clamp_int(row["ssh_port"], 1, 65535, 22)
+        user = (row["ssh_user"] or "").strip() or "root"
+        pw = d.get("password") or ""
+        name = row["name"]
+        if not pw:
+            enc = row["ssh_pass_enc"] if "ssh_pass_enc" in row.keys() else ""
+            if enc:
+                try:
+                    pw = decrypt_pass(enc)
+                except Exception:
+                    return jsonify({"ok": False, "error": "已存密码解密失败（CRED_KEY 可能已变更），请重新保存密码"}), 400
+        if not pw:
+            return jsonify({"ok": False, "error": "请输入 SSH 密码"}), 400
     cols = _clamp_int(d.get("cols"), 20, 300, 100)
     rows = _clamp_int(d.get("rows"), 10, 100, 30)
     client = None
@@ -965,7 +978,7 @@ def admin_ssh_connect():
                 pass
         return jsonify({"ok": False, "error": f"SSH 连接失败：{type(e).__name__}"}), 400
     sid = secrets.token_hex(8)
-    sess = _SSHSession(sid, nid, row["name"], client, chan)
+    sess = _SSHSession(sid, nid, name, client, chan)
     with _SSH_LOCK:
         _SSH_SESSIONS[sid] = sess
     threading.Thread(target=_ssh_reader, args=(sess,), daemon=True,
