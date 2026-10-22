@@ -33,6 +33,110 @@ except ImportError:
 DISK_ROOT = os.path.abspath(os.sep)
 
 
+# ================= 流量采集（v6.3：累计计数器） =================
+# 背景：旧版只上报全网卡的平均速率，服务端用 速率×间隔 反推总量，
+# 上报失败/间隔过大整段丢失，累计流量必然少于商家面板。
+# 新版按 Claude 复核方案改报「外网网卡累计计数器」，服务端做差分：
+# - 只选默认路由网卡（无默认路由时退回疑似物理网卡），排除
+#   lo/docker/桥/veth/tun/wg 等虚拟口，避免同一字节被重复计数；
+# - 环境变量 PROBE_IFACES="eth0,eth1" 可强制指定（多网卡/策略路由时）；
+# - 同时保留旧 rx/tx 速率字段（改按外网网卡差分算），老服务端仍可读。
+_NET_EXCLUDE = re.compile(
+    r'^(lo|docker\d*|br-.+|veth.+|virbr.+|vnet.+|tun\d*|tap.+|wg.+|'
+    r'tailscale.+|zt.+|cni.+|flannel.+|cali.+|kube.+|dummy.+|ifb.+)$')
+_net_prev = None  # (monotonic_ts, {iface: (rx_bytes, tx_bytes)})
+
+
+def _default_route_ifaces():
+    """从 /proc/net/route{,6} 读默认路由所在网卡名集合（非 Linux 返回空）。"""
+    names = set()
+    try:
+        with open('/proc/net/route') as fh:
+            next(fh, None)
+            for line in fh:
+                p = line.split()
+                if len(p) >= 8 and p[1] == '00000000' and p[7] == '00000000' \
+                        and int(p[3], 16) & 1:
+                    names.add(p[0])
+    except OSError:
+        pass
+    try:
+        with open('/proc/net/ipv6_route') as fh:
+            for line in fh:
+                p = line.split()
+                if len(p) >= 10 and p[0] == '0' * 32 and p[1] == '00':
+                    fl = int(p[8], 16)
+                    if fl & 1 and not fl & 0x200:  # UP 且非 REJECT
+                        names.add(p[9])
+    except OSError:
+        pass
+    return names
+
+
+def _select_ifaces(pernic):
+    forced = os.environ.get('PROBE_IFACES')  # 例 "eth0,eth1"，奇葩多网卡时用
+    if forced:
+        return [n.strip() for n in forced.split(',') if n.strip() in pernic]
+    names = {n for n in _default_route_ifaces() if n in pernic and n != 'lo'}
+    if not names:  # 无默认路由：退回看起来像物理网卡的
+        names = {n for n in pernic if not _NET_EXCLUDE.match(n)
+                 and not os.path.exists(f'/sys/class/net/{n}/master')}  # 跳过 bond/桥从口
+    return sorted(names)
+
+
+def _boot_id():
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def collect_net():
+    """采集外网网卡流量。返回 dict：
+    rx/tx        外网口速率 bytes/s（无基准时 0，兼容旧字段）；
+    rx_total/tx_total  累计字节（服务端差分记账的依据）；
+    ifaces       {网卡: {rx, tx}} 各自累计值；
+    boot_id      本次开机标识（判计数器重置用，非 Linux 为 None）；
+    counter_bits 计数器位宽（32 位回绕判断用）。
+    """
+    global _net_prev
+    now = time.monotonic()
+    try:
+        pernic = psutil.net_io_counters(pernic=True, nowrap=True)
+    except TypeError:  # 个别 psutil 版本不支持 nowrap
+        pernic = psutil.net_io_counters(pernic=True)
+    cur = {n: (pernic[n].bytes_recv, pernic[n].bytes_sent)
+           for n in _select_ifaces(pernic)}
+    rx_rate = tx_rate = 0
+    if _net_prev:
+        pt, pc = _net_prev
+        dt = max(now - pt, 1e-3)
+        rx_rate = round(sum(max(0, c[0] - pc[n][0])
+                            for n, c in cur.items() if n in pc) / dt)
+        tx_rate = round(sum(max(0, c[1] - pc[n][1])
+                            for n, c in cur.items() if n in pc) / dt)
+    _net_prev = (now, cur)
+    return {
+        'rx': rx_rate, 'tx': tx_rate,  # 旧字段仍发，值改为外网口速率
+        'rx_total': sum(c[0] for c in cur.values()),
+        'tx_total': sum(c[1] for c in cur.values()),
+        'ifaces': {n: {'rx': c[0], 'tx': c[1]} for n, c in cur.items()},
+        'boot_id': _boot_id(),
+        'counter_bits': 64 if sys.maxsize > 2 ** 32 else 32,
+    }
+
+
+def reset_net_baseline():
+    """清掉 collect_net 的速率基准（上报失败重连后调用）。
+
+    累计值 rx_total/ifaces 仍随下一包发出，服务端靠差分能把断线期间
+    的流量补回来；清基准只是避免本地速率按超长间隔算出失真值。
+    """
+    global _net_prev
+    _net_prev = None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="MyProbe Agent")
     p.add_argument("--server", default=os.environ.get("MYPROBE_SERVER", ""),
@@ -88,7 +192,11 @@ def static_info():
 
 
 def collect(prev_net, elapsed):
-    """采集一次动态指标。返回 (metrics, new_net_counters)。"""
+    """采集一次动态指标。返回 (metrics, new_net_counters)。
+
+    prev_net/elapsed 仍是全网卡计数器（仅作 collect_net 异常时的回退），
+    正常路径下 rx/tx 与累计字段由 collect_net() 按外网网卡给出。
+    """
     net = psutil.net_io_counters()
     rx = tx = 0
     if prev_net is not None and elapsed > 0:
@@ -102,7 +210,7 @@ def collect(prev_net, elapsed):
         except Exception:
             pass
 
-    return {
+    metrics = {
         "cpu": psutil.cpu_percent(interval=None),
         "mem": psutil.virtual_memory().percent,
         "swap": psutil.swap_memory().percent,
@@ -111,7 +219,12 @@ def collect(prev_net, elapsed):
         "tx": tx,
         "load1": load1,
         "uptime": int(time.time() - psutil.boot_time()),
-    }, net
+    }
+    try:
+        metrics.update(collect_net())
+    except Exception as e:
+        print(f"[Agent] collect_net 失败，回退全网卡速率: {e}", flush=True)
+    return metrics, net
 
 
 def post_report(args, payload):
@@ -276,6 +389,7 @@ def main():
             print(f"[Agent] 上报失败({fail_count}次): {e}，{wait}s 后重试", flush=True)
             time.sleep(wait)
             prev_net = psutil.net_io_counters()  # 重置流量基准，避免重连后速率突增
+            reset_net_baseline()  # 同步清 collect_net 基准（累计值不受影响，服务端差分补账）
             continue
         # 扣掉采集耗时，保持固定节拍
         spent = time.time() - start

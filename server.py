@@ -24,7 +24,8 @@ import time
 import urllib.request
 import urllib.error
 import collections
-from datetime import date, datetime
+import logging
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from functools import wraps
 
@@ -88,6 +89,14 @@ CREATE TABLE IF NOT EXISTS metrics (
     PRIMARY KEY (node_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
+CREATE TABLE IF NOT EXISTS traffic_state (
+    node_id  TEXT PRIMARY KEY,
+    ts       REAL NOT NULL,          -- 上次记账的上报时刻（epoch 秒，浮点：整秒会误杀同秒上报）
+    boot_id  TEXT,                   -- 上次上报的开机标识（判计数器重置）
+    ifaces   TEXT,                   -- JSON {"eth0":[rx,tx]}；NULL=上次是老 agent 上报
+    rx_rate  INTEGER DEFAULT 0,      -- 上次上报的速率（老 agent 间隔估算用）
+    tx_rate  INTEGER DEFAULT 0
+);
 """
 
 # v2 新增表（幂等：全部 IF NOT EXISTS）
@@ -260,6 +269,223 @@ def login_required(f):
         return f(*a, **kw)
     return wrapper
 
+# ---------------- 流量记账（v6.3：累计计数器差分；v6.4：防虚报三道闸） ----------------
+# 旧法：速率×时间差反推，dt>INTERVAL*3 整段丢弃，上报失败即永久丢数。
+# 新法（采纳 Claude 复核方案并按本库适配）：
+# - 新 agent 报各外网网卡累计 rx/tx（metrics.ifaces），服务端存基线做差分，
+#   间隔多长都补账；boot_id 变化视为计数器重启，32 位计数器单独处理回绕；
+# - 老 agent 只有 rx/tx 速率，继续走 rate*dt，但只在 dt<=INTERVAL*3 时记，
+#   且若上一条基线是新 agent 的累计值，老速率不再重复记（防双计）；
+# - 时区口径不变：日/月桶仍按服务端本地时间（time.localtime 同口径）切分，
+#   与历史数据一致，不因本次改造漂移一天。
+# v6.4 三道闸（2026-10-22 德/美虚报实测：日桶被灌到 494GB/2343GB，
+# 商家后台整月仅 28.88GB；根子在重置分支整段现值入账 + 基线异常重计）：
+# ① 计数器重置的 fresh 上限只认「间隔 + 启动宽限」，不再按 uptime(几天) 放行；
+# ② 正常节拍(间隔<=120s)加速率交叉校验：差分远超 agent 同期自报速率×间隔
+#    的量直接丢弃并重建基线，宁可少记一段也不灌入几百 GB；
+# ③ 记账全程串行锁，防并发上报同读一条基线把同一段差分记两遍。
+_traffic_log = logging.getLogger("probe.traffic")
+_TRAFFIC_LOCK = threading.Lock()
+TRAFFIC_MAX_BPS = 2_000_000_000  # 单方向合理上限 ~16 Gbit/s，超了视为计数器毛刺
+TRAFFIC_LEGACY_GAP_FILL = False  # True=老 agent 长间隔用平均速率估算补账（默认关，估算会虚增）
+
+
+def _traffic_split(t0, t1, rx, tx):
+    """把 [t0,t1] 的用量按服务端本地日期切分，逐日 yield (date, rx, tx)。
+
+    跨天按时间比例分，余数归最后一天，总和不丢字节。
+    """
+    a, b = datetime.fromtimestamp(t0), datetime.fromtimestamp(t1)
+    if a.date() == b.date() or t1 <= t0:
+        yield b.date(), rx, tx
+        return
+    total, cur, lrx, ltx = float(t1 - t0), a, rx, tx
+    while cur.date() < b.date():
+        nxt = datetime.combine(cur.date() + timedelta(days=1),
+                               datetime.min.time())
+        f = (nxt - cur).total_seconds() / total
+        prx, ptx = int(rx * f), int(tx * f)
+        lrx, ltx = lrx - prx, ltx - ptx
+        yield cur.date(), prx, ptx
+        cur = nxt
+    yield b.date(), lrx, ltx
+
+
+def _traffic_add_usage(db, node_id, t0, t1, rx, tx):
+    if rx <= 0 and tx <= 0:
+        return
+    for day, prx, ptx in _traffic_split(t0, t1, rx, tx):
+        db.execute(
+            """INSERT INTO traffic_daily (node_id, day, rx_bytes, tx_bytes)
+               VALUES (?,?,?,?)
+               ON CONFLICT(node_id, day) DO UPDATE SET
+                 rx_bytes = rx_bytes + excluded.rx_bytes,
+                 tx_bytes = tx_bytes + excluded.tx_bytes""",
+            (node_id, day.isoformat(), prx, ptx))
+        db.execute(
+            """INSERT INTO traffic_monthly (node_id, month, rx_bytes, tx_bytes)
+               VALUES (?,?,?,?)
+               ON CONFLICT(node_id, month) DO UPDATE SET
+                 rx_bytes = rx_bytes + excluded.rx_bytes,
+                 tx_bytes = tx_bytes + excluded.tx_bytes""",
+            (node_id, day.strftime("%Y-%m"), prx, ptx))
+
+
+def _traffic_delta(old, new, boot_changed, bits, cap, fresh_cap):
+    """单网卡单方向计数器差分。cap=正常间隔上限；fresh_cap=计数器重启时的上限。
+
+    重启后计数器从 0 起算，其值是「开机以来」的真实流量，与上次上报的
+    间隔长短无关 —— 所以不能拿 cap=MAX_BPS×短间隔 去卡它（Claude 原稿
+    的坑），改用 fresh_cap（按 agent 上报的 uptime 折算，见调用处）。
+    """
+    if boot_changed or new < old:
+        if not boot_changed and bits == 32 and old > 2 ** 31:  # 32 位计数器回绕
+            wrapped = new + 2 ** 32 - old
+            if wrapped <= cap:
+                return wrapped
+        d = new  # 计数器重启：当前值全部是新流量
+        if d > fresh_cap:
+            _traffic_log.warning("implausible fresh counter %d > cap %d, dropped",
+                                 d, fresh_cap)
+            return 0
+        return d
+    d = new - old
+    if d > cap:
+        _traffic_log.warning("implausible delta %d > cap %d, dropped", d, cap)
+        return 0
+    return d
+
+
+def _traffic_account_counters(db, node_id, row, p, now):
+    """新 agent：按累计计数器差分记账。返回 (boot_id, ifaces_json, rx_rate, tx_rate)。"""
+    new = {}
+    for n, v in p["ifaces"].items():
+        if isinstance(v, dict):
+            try:
+                new[str(n)] = (int(v["rx"]), int(v["tx"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    boot = p.get("boot_id") if isinstance(p.get("boot_id"), str) else None
+    try:
+        bits = int(p.get("counter_bits", 64))
+    except (TypeError, ValueError):
+        bits = 64
+    if row and row[2]:  # 有累计基线才差分；首次/刚从老 agent 切过来只存基线
+        t0, old = row[0], json.loads(row[2])
+        boot_changed = bool(boot and row[1] and boot != row[1])
+        gap = max(now - t0, 1)
+        cap = TRAFFIC_MAX_BPS * gap
+        # v6.4①：重启场景上限只认计数器真实寿命的上界 = min(本次 uptime,
+        # 间隔+启动宽限)。v6.3 按 uptime(几天) 折算等于不设防：假重置/回退
+        # 时整段累计现值(几百 GB)能整段过闸入账。真重启时 agent 随开机
+        # 即起、首报在数分钟内，gap+300s 宽限已足够。
+        uptime = p.get("uptime")
+        fresh_span = gap + 300
+        if isinstance(uptime, (int, float)) and uptime > 0:
+            fresh_span = min(fresh_span, int(uptime) + 300)
+        fresh_cap = TRAFFIC_MAX_BPS * int(fresh_span)
+        rx = tx = 0
+        for n, (nrx, ntx) in new.items():
+            o = old.get(n)  # 新出现的网卡只存基线，下轮再差分
+            if o:
+                rx += _traffic_delta(o[0], nrx, boot_changed, bits, cap, fresh_cap)
+                tx += _traffic_delta(o[1], ntx, boot_changed, bits, cap, fresh_cap)
+        # v6.4②：速率交叉校验(仅正常节拍)。服务端差分应与 agent 同期自报
+        # 速率×间隔基本一致；若差分 > 速率×间隔×3 + 20MB，说明基线已错位
+        # (假重置/基线回退重计)，丢弃本段并靠本次返回值重建基线 —— 丢的
+        # 至多是这一个间隔的真实流量，不丢则会灌入几十~几百 GB 假流量。
+        if gap <= 120:
+            allow_rx = max(_as_int(p.get("rx")) * gap * 3, 20 * 1024 * 1024)
+            allow_tx = max(_as_int(p.get("tx")) * gap * 3, 20 * 1024 * 1024)
+            if rx > allow_rx:
+                _traffic_log.warning(
+                    "node %s implausible rx delta %d (rate %s gap %.0fs), dropped",
+                    node_id, rx, p.get("rx"), gap)
+                rx = 0
+            if tx > allow_tx:
+                _traffic_log.warning(
+                    "node %s implausible tx delta %d (rate %s gap %.0fs), dropped",
+                    node_id, tx, p.get("tx"), gap)
+                tx = 0
+        _traffic_add_usage(db, node_id, t0, now, rx, tx)  # 间隔多长都记，不再丢段
+    return boot, json.dumps({n: list(v) for n, v in new.items()}), \
+        _as_int(p.get("rx")), _as_int(p.get("tx"))
+
+
+def _as_int(v):
+    return int(v) if isinstance(v, (int, float)) else 0
+
+
+def _traffic_account_legacy(db, node_id, row, p, now):
+    """老 agent：只有速率。返回 (boot_id, ifaces_json, rx_rate, tx_rate)。
+
+    上一条是新 agent 的累计基线时（row[2] 非空）不记速率账 —— 那段流量
+    已被累计差分覆盖，再记就是双计；同时原样保留基线，别冲掉。
+    """
+    rx_r, tx_r = _as_int(p.get("rx")), _as_int(p.get("tx"))
+    if row and not row[2]:  # 上一条也是老 agent
+        t0, dt = row[0], now - row[0]
+        if 0 < dt <= INTERVAL * 3:
+            _traffic_add_usage(db, node_id, t0, now,
+                               int(rx_r * dt), int(tx_r * dt))
+        elif TRAFFIC_LEGACY_GAP_FILL and dt > 0:  # 估算补账：新老速率均值，最多补 1 小时
+            span = min(dt, 3600)
+            _traffic_add_usage(db, node_id, now - span, now,
+                               int(((row[3] or 0) + rx_r) / 2 * span),
+                               int(((row[4] or 0) + tx_r) / 2 * span))
+        else:
+            _traffic_log.info("node %s: skipped %ss gap (legacy agent)",
+                              node_id, dt)
+    if row and row[2]:
+        return row[1], row[2], rx_r, tx_r  # 保留新 agent 基线
+    return None, None, rx_r, tx_r
+
+
+def account_traffic(db, node_id, p, now=None):
+    """流量记账入口（v6.4③：全程串行，防并发上报同读一条基线重计同一段差分）。"""
+    with _TRAFFIC_LOCK:
+        _account_traffic_locked(db, node_id, p, now)
+
+
+def _account_traffic_locked(db, node_id, p, now=None):
+    """流量记账实现：p 是 metrics dict（不是整个上报 payload）。
+
+    不手动 BEGIN/COMMIT：api_report 本身已在隐式事务里写 nodes/metrics，
+    这里只用 SAVEPOINT 做局部回滚隔离，最终仍由 handler 的 db.commit()
+    统一提交。记账异常绝不拖垮上报（打印后吞掉）。
+    """
+    now = float(now or time.time())  # 浮点：整秒粒度会把同秒的第二条当重复丢掉
+    if not isinstance(p, dict):
+        return
+    try:
+        db.execute("SAVEPOINT traffic_acct")
+        try:
+            row = db.execute(
+                "SELECT ts, boot_id, ifaces, rx_rate, tx_rate FROM traffic_state "
+                "WHERE node_id=?", (node_id,)).fetchone()
+            if row and now <= row[0]:  # 重复/乱序上报
+                db.execute("RELEASE traffic_acct")
+                return
+            fn = _traffic_account_counters if isinstance(p.get("ifaces"), dict) \
+                and p.get("ifaces") else _traffic_account_legacy
+            boot, ifaces, rr, tr = fn(db, node_id, row, p, now)
+            db.execute(
+                """INSERT INTO traffic_state (node_id, ts, boot_id, ifaces, rx_rate, tx_rate)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(node_id) DO UPDATE SET
+                     ts=excluded.ts, boot_id=excluded.boot_id,
+                     ifaces=excluded.ifaces, rx_rate=excluded.rx_rate,
+                     tx_rate=excluded.tx_rate""",
+                (node_id, now, boot, ifaces, rr, tr))
+            db.execute("RELEASE traffic_acct")
+        except Exception:
+            db.execute("ROLLBACK TO traffic_acct")
+            db.execute("RELEASE traffic_acct")
+            raise
+    except Exception as e:
+        print(f"[traffic] 节点 {node_id} 记账失败（已忽略）: {e}", file=sys.stderr)
+
+
 # ---------------- Agent 上报 ----------------
 # v4.2：agent 自助下发 —— 看板直接提供 agent.py 和一键安装脚本，无需第三方文件链接
 with open(os.path.join(BASE_DIR, "agent.py"), encoding="utf-8") as _f:
@@ -383,11 +609,6 @@ def api_report():
         v = m.get(key)
         return int(v) if isinstance(v, (int, float)) else None
 
-    # v2：流量累计 —— 用（速率 × 时间差）折算字节数，记入当月桶
-    prev = db.execute(
-        "SELECT ts FROM metrics WHERE node_id=? ORDER BY ts DESC LIMIT 1",
-        (nid,),
-    ).fetchone()
     rxv, txv = i("rx"), i("tx")
 
     db.execute(
@@ -397,28 +618,10 @@ def api_report():
         (nid, now, f("cpu"), f("mem"), f("swap"), f("disk"),
          rxv, txv, f("load1"), i("uptime")),
     )
-    if prev and prev["ts"] and rxv is not None and txv is not None:
-        dt = now - prev["ts"]
-        if 0 < dt <= INTERVAL * 3:  # 间隔异常大（离线很久）则不计，避免虚增
-            month = time.strftime("%Y-%m", time.localtime(now))
-            db.execute(
-                """INSERT INTO traffic_monthly (node_id, month, rx_bytes, tx_bytes)
-                   VALUES (?,?,?,?)
-                   ON CONFLICT(node_id, month) DO UPDATE SET
-                     rx_bytes = rx_bytes + excluded.rx_bytes,
-                     tx_bytes = tx_bytes + excluded.tx_bytes""",
-                (nid, month, rxv * dt, txv * dt),
-            )
-            # v4：每日流量 —— 同一份数据再记入按天桶（累计流量只读月桶，不重复计）
-            day = time.strftime("%Y-%m-%d", time.localtime(now))
-            db.execute(
-                """INSERT INTO traffic_daily (node_id, day, rx_bytes, tx_bytes)
-                   VALUES (?,?,?,?)
-                   ON CONFLICT(node_id, day) DO UPDATE SET
-                     rx_bytes = rx_bytes + excluded.rx_bytes,
-                     tx_bytes = tx_bytes + excluded.tx_bytes""",
-                (nid, day, rxv * dt, txv * dt),
-            )
+    # v6.3：流量记账改走累计计数器差分（见 account_traffic），
+    # 不再用 速率×dt 反推、不再丢弃长间隔；老 agent 自动走 legacy 分支。
+    # 传浮点时间：记账基线的重复/乱序判断需要亚秒精度，metrics 仍用整秒 now。
+    account_traffic(db, nid, m, time.time())
     db.commit()
     # v5：agent 自带拨测结果入库（最新值 + 历史）
     np = data.get("probes")
@@ -2836,7 +3039,7 @@ from jinja2 import DictLoader as _DictLoader
 from jinja2 import Environment as _JinjaEnv
 from jinja2 import FileSystemLoader as _FileSystemLoader
 
-MYPROBE_VERSION = "6.2"
+MYPROBE_VERSION = "6.4"
 
 THEMES_DIR = os.environ.get("MYPROBE_THEMES_DIR", os.path.join(BASE_DIR, "themes"))
 PLUGINS_DIR = os.environ.get("MYPROBE_PLUGINS_DIR", os.path.join(BASE_DIR, "plugins"))

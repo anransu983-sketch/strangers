@@ -300,7 +300,7 @@ function nodeCard(n){
   var mini2 = '<div>⇑ ' + gb(n.total_tx_gb) + ' GB</div><div>⇓ ' + gb(n.total_rx_gb) + ' GB</div>';
   var mini3 = "";
   if (n.days_left!==null && n.days_left!==undefined) mini3 += '<div>余期' + n.days_left + '天</div>';
-  if (n.remain_value!==null && n.remain_value!==undefined) mini3 += '<div>余值¥' + n.remain_value + '</div>';
+  if (n.remain_value!==null && n.remain_value!==undefined) mini3 += '<div>余值' + (n.currency||'¥') + n.remain_value + '</div>';
   if (!mini3) mini3 = '<div class="dim">—</div>';
   /* 探测区（v5：本节点 agent 独立探测） */
   var probeSec = "";
