@@ -911,6 +911,35 @@ def api_me():
 def api_agent_token():
     return jsonify({"ok": True, "token": AGENT_TOKEN})
 
+@app.route("/api/admin/nodes", methods=["POST"])
+@login_required
+def admin_create_node():
+    """v6.5：App「SSH 凭据页新增 VPS」入口——先建节点占位（仅 id/name），
+    agent 首次上报时自动补全主机信息且不覆盖此处填的显示名；
+    也可只存 SSH 凭据、在终端页直连，不装 agent 节点保持离线。"""
+    d = request.get_json(silent=True) or {}
+    nid = (d.get("id") or "").strip()
+    name = (d.get("name") or "").strip()
+    if not valid_node_id(nid):
+        return jsonify({"ok": False, "error": "节点ID不合法（字母/数字开头，可含 - _，最长64）"}), 400
+    if not name:
+        return jsonify({"ok": False, "error": "名称不能为空"}), 400
+    if len(name) > 64:
+        return jsonify({"ok": False, "error": "名称最长 64 字"}), 400
+    db = get_db()
+    if db.execute("SELECT 1 FROM nodes WHERE id=?", (nid,)).fetchone():
+        return jsonify({"ok": False, "error": "节点ID已存在"}), 409
+    # 与 agent 首报建节点一致：新节点排到末尾
+    mx = db.execute("SELECT MAX(sort_order) FROM nodes").fetchone()[0]
+    new_order = (mx if mx is not None else -1) + 1
+    db.execute(
+        "INSERT INTO nodes (id, name, first_seen, sort_order) VALUES (?,?,?,?)",
+        (nid, name, int(time.time()), new_order),
+    )
+    db.commit()
+    return jsonify({"ok": True, "id": nid})
+
+
 @app.route("/api/admin/node/<nid>/rename", methods=["POST"])
 @login_required
 def admin_rename(nid):
@@ -3039,7 +3068,7 @@ from jinja2 import DictLoader as _DictLoader
 from jinja2 import Environment as _JinjaEnv
 from jinja2 import FileSystemLoader as _FileSystemLoader
 
-MYPROBE_VERSION = "6.4"
+MYPROBE_VERSION = "6.5"
 
 THEMES_DIR = os.environ.get("MYPROBE_THEMES_DIR", os.path.join(BASE_DIR, "themes"))
 PLUGINS_DIR = os.environ.get("MYPROBE_PLUGINS_DIR", os.path.join(BASE_DIR, "plugins"))
